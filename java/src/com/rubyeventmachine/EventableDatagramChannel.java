@@ -37,6 +37,7 @@ import java.nio.channels.DatagramChannel;
 import java.util.LinkedList;
 import java.io.*;
 import java.net.*;
+import java.util.Date;
 
 public class EventableDatagramChannel implements EventableChannel {
 	
@@ -55,6 +56,9 @@ public class EventableDatagramChannel implements EventableChannel {
 	boolean bCloseScheduled;
 	LinkedList<Packet> outboundQ;
 	SocketAddress returnAddress;
+	long inactivityPeriod;
+    long lastActivity;
+    long inActivityKey;	
 	
 
 	public EventableDatagramChannel (DatagramChannel dc, String _binding, Selector sel) throws ClosedChannelException {
@@ -63,6 +67,7 @@ public class EventableDatagramChannel implements EventableChannel {
 		selector = sel;
 		bCloseScheduled = false;
 		outboundQ = new LinkedList<Packet>();
+		lastActivity = (new Date()).getTime();
 		
 		dc.register(selector, SelectionKey.OP_READ, this);
 	}
@@ -163,9 +168,36 @@ public class EventableDatagramChannel implements EventableChannel {
 		// the outbound queue.
 		return (bCloseScheduled && outboundQ.isEmpty()) ? false : true;
 	}
+    public void setCommInactivityTimeout(long seconds) {
+		inactivityPeriod = seconds;
+	}
 
-	public void setCommInactivityTimeout (long seconds) {
-		// TODO
-		System.out.println ("DATAGRAM: SET COMM INACTIVITY UNIMPLEMENTED " + seconds);
+	public void updateActivityTimeStamp() {
+		lastActivity = new Date().getTime();
+	}
+
+	public boolean isInactive() {
+		long now = new Date().getTime();
+		if ((now - lastActivity) / 1000 > inactivityPeriod) {
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	public long getLastActivity() {
+		return lastActivity;
+	}
+
+	public long getInActivityPeriod() {
+		return inactivityPeriod;
+	}
+
+	public void setInactivityKey(long mills) {
+		inActivityKey = mills;
+	}
+
+	public long currentInActivityKey() {
+		return inActivityKey;
 	}
 }

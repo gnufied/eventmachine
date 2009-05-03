@@ -51,25 +51,35 @@ public class EventableSocketChannel implements EventableChannel {
 	SocketChannel channel;
 	String binding;
 	Selector selector;
-	LinkedList<ByteBuffer> outboundQ;
+	ArrayDeque<ByteBuffer> outboundQ;
 	boolean bCloseScheduled;
+	boolean connectionStatus = false;
+
+	long inactivityPeriod;
+	long lastActivity;
+	long inActivityKey;
+	boolean writeScheduled;
+
 	boolean bConnectPending;
 	
 	SSLEngine sslEngine;
-	
-	
 	SSLContext sslContext;
-
-
-	public EventableSocketChannel (SocketChannel sc, String _binding, Selector sel) throws ClosedChannelException {
+	
+	SelectionKey channelKey;
+	public EventableSocketChannel(SocketChannel sc, String _binding,
+			Selector sel, int ops) throws ClosedChannelException {
+		writeScheduled = false;
 		channel = sc;
 		binding = _binding;
 		selector = sel;
 		bCloseScheduled = false;
 		bConnectPending = false;
-		outboundQ = new LinkedList<ByteBuffer>();
-		
-		sc.register(selector, SelectionKey.OP_READ, this);
+		outboundQ = new ArrayDeque<ByteBuffer>();
+		lastActivity = new Date().getTime();
+		if (ops != 0) {
+			connectionStatus = true;
+			channelKey = sc.register(selector, ops, this);
+		}
 	}
 	
 	public String getBinding() {
@@ -87,27 +97,20 @@ public class EventableSocketChannel implements EventableChannel {
 		}
 	}
 	
-	public void scheduleOutboundData (ByteBuffer bb) {
-		try {
-			if ((!bCloseScheduled) && (bb.remaining() > 0)) {
-				if (sslEngine != null) {
-					ByteBuffer b = ByteBuffer.allocate(32*1024); // TODO, preallocate this buffer.
-					sslEngine.wrap(bb, b);
-					b.flip();
-					outboundQ.addLast(b);
-				}
-				else {
-					outboundQ.addLast(bb);
-				}
-				channel.register(selector, SelectionKey.OP_WRITE | SelectionKey.OP_READ | (bConnectPending ? SelectionKey.OP_CONNECT : 0), this);
-			}
-		} catch (ClosedChannelException e) {
-			throw new RuntimeException ("no outbound data");			
-		} catch (SSLException e) {
-			throw new RuntimeException ("no outbound data");
+	public void scheduleOutboundData(ByteBuffer bb) { 
+		try { 
+		    if(sslEngine != null) { 
+			ByteBuffer b= ByteBuffer.allocate(32*1024);
+			sslEngine.wrap(bb,b);
+			b.flip();
+			outboundQ.offer(b);
+		    } else outboundQ.offer(bb);
+		} catch(SSLException e) { 
+		    throw new RuntimeException("Error while writing to ssl channel");
 		}
+		writeOutboundData();
 	}
-	
+
 	public void scheduleOutboundDatagram (ByteBuffer bb, String recipAddress, int recipPort) {
 		throw new RuntimeException ("datagram sends not supported on this channel");
 	}
@@ -115,13 +118,32 @@ public class EventableSocketChannel implements EventableChannel {
 	/**
 	 * Called by the reactor when we have selected readable.
 	 */
-	public void readInboundData (ByteBuffer bb) {
+	public void readInboundData(ByteBuffer bb){
+		int dataLength = 0;
 		try {
-			channel.read(bb);
+			dataLength = channel.read(bb);
 		} catch (IOException e) {
-			throw new RuntimeException ("i/o error");
+			System.out.println("I am in readInboundData");
+			signalConnectionFail();
+		}
+
+		if (dataLength == -1){
+			System.out.println("I am throwing from data length");
+			signalConnectionFail();
 		}
 	}
+	
+	public void signalConnectionFail() {
+		System.out.println("Cancel the key from taking part in polling");
+		connectionStatus = false;
+		channelKey.cancel();
+		try {
+			channel.close();
+		} catch(IOException ex) {}
+		
+		throw new ClientDisconnectException("Client closed the connection");
+	}
+	
 	/**
 	 * Called by the reactor when we have selected writable.
 	 * Return false to indicate an error that should cause the connection to close.
@@ -137,37 +159,49 @@ public class EventableSocketChannel implements EventableChannel {
 	 */
 	public boolean writeOutboundData(){
 		while (!outboundQ.isEmpty()) {
-			ByteBuffer b = outboundQ.getFirst();
+			ByteBuffer b = outboundQ.peek();
+			int n = 0;
 			try {
-				if (b.remaining() > 0)
-					channel.write(b);
+				if (b.hasRemaining())
+					n = channel.write(b);
+			} catch (IOException e) {
+				System.out.println("Error while writing exception");
+				signalConnectionFail();
+				//return false;
 			}
-			catch (IOException e) {
-				return false;
-			}
-
 			// Did we consume the whole outbound buffer? If yes,
 			// pop it off and keep looping. If no, the outbound network
 			// buffers are full, so break out of here.
-			if (b.remaining() == 0)
-				outboundQ.removeFirst();
-			else
-				break;
+			if (!b.hasRemaining()) outboundQ.poll();
+			else break;
 		}
 
-		if (outboundQ.isEmpty()) {
-			try {
-				channel.register(selector, SelectionKey.OP_READ, this);
-			} catch (ClosedChannelException e) {
-			}
+		if (outboundQ.isEmpty()){
+			cancelWrite();	
 		}
-		
+		else if (!outboundQ.isEmpty() && !writeScheduled) {
+			System.out.println("############ schedule write event ######## ");
+			writeScheduled = true;
+			channelKey.interestOps(SelectionKey.OP_WRITE);
+		}
+
 		// ALWAYS drain the outbound queue before triggering a connection close.
-		// If anyone wants to close immediately, they're responsible for clearing
+		// If anyone wants to close immediately, they're responsible for
+		// clearing
 		// the outbound queue.
-		return (bCloseScheduled && outboundQ.isEmpty()) ? false : true;
- 	}
+		if(bCloseScheduled && outboundQ.isEmpty()) {
+			signalConnectionFail();
+			return false;
+		} else return true;
+	}
 	
+	public void cancelWrite() {
+		if (writeScheduled) {
+			writeScheduled = false;
+			channelKey.interestOps(SelectionKey.OP_READ);
+		}
+	}
+
 	public void setConnectPending() throws ClosedChannelException {
 		channel.register(selector, SelectionKey.OP_CONNECT, this);
 		bConnectPending = true;
@@ -186,21 +220,20 @@ public class EventableSocketChannel implements EventableChannel {
 			return false;
 		}
 		bConnectPending = false;
-		channel.register(selector, SelectionKey.OP_READ | (outboundQ.isEmpty() ? 0 : SelectionKey.OP_WRITE), this);
+		channelKey = channel.register(selector, SelectionKey.OP_READ, this);
 		return true;
 	}
 	
 	public void scheduleClose (boolean afterWriting) {
 		// TODO: What the hell happens here if bConnectPending is set?
-		if (!afterWriting)
-			outboundQ.clear();
-		try {
-			channel.register(selector, SelectionKey.OP_READ|SelectionKey.OP_WRITE, this);
-		} catch (ClosedChannelException e) {
-			throw new RuntimeException ("unable to schedule close"); // TODO, get rid of this.
-		}
+		if (!afterWriting) outboundQ.clear();
+		else {
+			writeScheduled = true;
+			channelKey.interestOps(SelectionKey.OP_WRITE);
+		}		
 		bCloseScheduled = true;
 	}
+	
 	public void startTls() {
 		if (sslEngine == null) {
 			try {
@@ -236,9 +269,41 @@ public class EventableSocketChannel implements EventableChannel {
 		else
 			return bb;
 	}
+	
+	public void setCommInactivityTimeout(long seconds) {
+		inactivityPeriod = seconds;
+	}
 
-	public void setCommInactivityTimeout (long seconds) {
-		// TODO
-		System.out.println ("SOCKET: SET COMM INACTIVITY UNIMPLEMENTED " + seconds);
+	public boolean isInactive() {
+		long now = new Date().getTime();
+		if ((now - lastActivity) / 1000 > inactivityPeriod) {
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	public void updateActivityTimeStamp() {
+		lastActivity = new Date().getTime();
+	}
+
+	public long getLastActivity() {
+		return lastActivity;
+	}
+
+	public long getInActivityPeriod() {
+		return inactivityPeriod;
+	}
+
+	public void setInactivityKey(long mills) {
+		inActivityKey = mills;
+	}
+
+	public long currentInActivityKey() {
+		return inActivityKey;
+	}
+
+	public SocketChannel getChannel() {
+		return channel;
 	}
 }

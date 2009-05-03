@@ -53,5 +53,15 @@ public interface EventableChannel {
 	
 	public boolean writeOutboundData();
 
-	public void setCommInactivityTimeout (long seconds);
+	public boolean isInactive();
+
+    public void setCommInactivityTimeout (long seconds);
+	
+    public void updateActivityTimeStamp();
+    
+    public long getLastActivity();
+    public long getInActivityPeriod();
+
+    public long currentInActivityKey();
+    public void setInactivityKey(long millis);
 }
