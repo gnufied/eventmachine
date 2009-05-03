@@ -50,7 +50,8 @@ public class EmReactor {
 	private TreeMap<Long, String> Timers;
 	private TreeMap<String, EventableChannel> Connections;
 	private TreeMap<String, ServerSocketChannel> Acceptors;
-
+	private TreeMap<Long, Set<String>> interestedInInactivity;
+	
 	private boolean bRunReactor;
 	private long BindingIndex;
 	private ByteBuffer EmptyByteBuffer;
@@ -62,6 +63,7 @@ public class EmReactor {
 		Timers = new TreeMap<Long, String>();
 		Connections = new TreeMap<String, EventableChannel>();
 		Acceptors = new TreeMap<String, ServerSocketChannel>();
+		interestedInInactivity = new TreeMap<Long, Set<String>>();
 		
 		BindingIndex = 100000;
 		EmptyByteBuffer = ByteBuffer.allocate(0);
@@ -70,20 +72,7 @@ public class EmReactor {
 		myReadBuffer = ByteBuffer.allocate(32*1024); // don't use a direct buffer. Ruby doesn't seem to like them.
 		timerQuantum = 98;
 	}
-	
-	/**
-	 * Intended to be overridden in languages (like Ruby) that can't handle ByteBuffer. This is a stub.
-	 * Obsolete now that I figured out how to make Ruby deal with ByteBuffers.
-	 * @param sig
-	 * @param eventType
-	 * @param data
-	 */
-	/*
- 	public void stringEventCallback (String sig, int eventType, String data) {
-		System.out.println ("Default event callback: " + sig + " " + eventType + " " + data);
-	}
-	*/
- 	
+		
  	/**
  	 * This is a no-op stub, intended to be overridden in user code.
  	 * @param sig
@@ -108,6 +97,9 @@ public class EmReactor {
  			if (!bRunReactor) break;
  			runTimers();
  			if (!bRunReactor) break;
+ 			checkForInactivity();
+ 			if (!bRunReactor) break;
+ 			
  			mySelector.select(timerQuantum);
  			 	
  			Iterator<SelectionKey> it = mySelector.selectedKeys().iterator();
@@ -116,91 +108,123 @@ public class EmReactor {
  				it.remove();
 
  				try {
- 					if (k.isAcceptable()) {
- 						ServerSocketChannel ss = (ServerSocketChannel) k.channel();
- 						SocketChannel sn;
- 						while ((sn = ss.accept()) != null) {
- 							sn.configureBlocking(false);
- 							String b = createBinding();
- 							EventableSocketChannel ec = new EventableSocketChannel (sn, b, mySelector);
- 							Connections.put(b, ec);
- 							eventCallback ((String)k.attachment(), EM_CONNECTION_ACCEPTED, ByteBuffer.wrap(b.getBytes()));
- 						}
- 					}
-
- 					if (k.isReadable()) {
- 						EventableChannel ec = (EventableChannel)k.attachment();
- 						myReadBuffer.clear();
- 						ec.readInboundData (myReadBuffer);
- 						myReadBuffer.flip();
- 						String b = ec.getBinding();
- 						if (myReadBuffer.limit() > 0) {
- 							eventCallback (b, EM_CONNECTION_READ, myReadBuffer);
- 						}
- 						else {
- 							eventCallback (b, EM_CONNECTION_UNBOUND, EmptyByteBuffer);
- 							Connections.remove(b);
- 							k.channel().close();							
- 						}
- 						/*
-						System.out.println ("READABLE");
- 						SocketChannel sn = (SocketChannel) k.channel();
- 						//ByteBuffer bb = ByteBuffer.allocate(16 * 1024);
- 						// Obviously not thread-safe, since we're using the same buffer for every connection.
- 						// This should minimize the production of garbage, though.
- 						// TODO, we need somehow to make a call to the EventableChannel, so we can pass the
- 						// inbound data through an SSLEngine. Hope that won't break the strategy of using one
- 						// global read-buffer.
- 						myReadBuffer.clear();
- 						int r = sn.read(myReadBuffer);
- 						if (r > 0) {
- 							myReadBuffer.flip();
- 							//bb = ((EventableChannel)k.attachment()).dispatchInboundData (bb);
- 							eventCallback (((EventableChannel)k.attachment()).getBinding(), EM_CONNECTION_READ, myReadBuffer);
- 						}
- 						else {
- 							// TODO. Figure out if a socket that selects readable can ever return 0 bytes
- 							// without it being indicative of an error condition. If Java is like C, the answer is no.
- 							String b = ((EventableChannel)k.attachment()).getBinding();
- 							eventCallback (b, EM_CONNECTION_UNBOUND, EmptyByteBuffer);
- 							Connections.remove(b);
- 							sn.close();
- 						}
- 						*/
- 					}
- 				
-
- 					if (k.isWritable()) {
- 						EventableChannel ec = (EventableChannel)k.attachment();
- 						if (!ec.writeOutboundData()) {
- 							eventCallback (ec.getBinding(), EM_CONNECTION_UNBOUND, EmptyByteBuffer);
- 							Connections.remove (ec.getBinding());
- 							k.channel().close();
- 						}
- 					}
- 					
- 					if (k.isConnectable()) {
- 						EventableSocketChannel ec = (EventableSocketChannel)k.attachment();
- 						if (ec.finishConnecting()) {
- 							eventCallback (ec.getBinding(), EM_CONNECTION_COMPLETED, EmptyByteBuffer);
- 						}
- 						else {
- 							Connections.remove (ec.getBinding());
- 							k.channel().close();
- 							eventCallback (ec.getBinding(), EM_CONNECTION_UNBOUND, EmptyByteBuffer);
- 						}
- 					}
- 				}
+ 					if(k.isAcceptable()) acceptClient(k);
+ 					else if(k.isReadable()) readData(k);
+ 					else if(k.isWritable()) handleWrite(k);
+ 					else if(k.isConnectable()) completeExternalConnection(k);
+ 				} 				
  				catch (CancelledKeyException e) {
- 					// No-op. We can come here if a read-handler closes a socket before we fall through
- 					// to call isWritable.
+ 					e.printStackTrace();
  				}
- 				
+ 				catch (IOException ex){
+ 					ex.printStackTrace();
+ 				} 				
   			}
    		}
  		
  		close();
 	}
+	
+	public void handleWrite(SelectionKey k) throws IOException {
+		EventableChannel ec = (EventableChannel) k.attachment();
+		ec.updateActivityTimeStamp();
+		try {
+			ec.writeOutboundData();
+		} catch (ClientDisconnectException ex) {
+			cleanupConnection(ec);
+		}
+	}
+
+	public void readData(SelectionKey k) throws IOException {
+		EventableChannel ec = (EventableChannel) k.attachment();
+		myReadBuffer.clear();
+		try {
+			ec.readInboundData(myReadBuffer);
+			myReadBuffer.flip();
+			ec.updateActivityTimeStamp();
+			eventCallback(ec.getBinding(), EM_CONNECTION_READ, myReadBuffer);
+		} catch (ClientDisconnectException e) {
+			System.out.println("There was an exception here");
+			cleanupConnection(ec);
+		}
+	}
+
+	public void acceptClient(SelectionKey k) throws IOException {
+		ServerSocketChannel ss = (ServerSocketChannel) k.channel();
+		SocketChannel sn;
+		while ((sn = ss.accept()) != null) {
+			sn.configureBlocking(false);
+			String b = createBinding();
+			EventableSocketChannel ec = new EventableSocketChannel(sn, b,
+					mySelector, SelectionKey.OP_READ);
+			Connections.put(b, ec);
+			eventCallback((String) k.attachment(), EM_CONNECTION_ACCEPTED,
+					ByteBuffer.wrap(b.getBytes()));
+		}
+	}
+
+	public void completeExternalConnection(SelectionKey k) throws IOException {
+		EventableSocketChannel ec = (EventableSocketChannel) k.attachment();
+		if (ec.finishConnecting()) {
+			eventCallback(ec.getBinding(), EM_CONNECTION_COMPLETED,
+					EmptyByteBuffer);
+		} else {
+			Connections.remove(ec.getBinding());
+			k.channel().close();
+			eventCallback(ec.getBinding(), EM_CONNECTION_UNBOUND,
+					EmptyByteBuffer);
+		}
+	}
+
+	public void cleanupConnection(EventableChannel ec) {
+		eventCallback(ec.getBinding(), EM_CONNECTION_UNBOUND, EmptyByteBuffer);
+		Connections.remove(ec.getBinding());
+		long inactivitykey = ec.currentInActivityKey();
+		Set<String> toRemove = interestedInInactivity.get(inactivitykey);
+		if (toRemove != null) {
+			toRemove.remove(ec.getBinding());
+			interestedInInactivity.put(inactivitykey, toRemove);
+		}
+	}
+
+	public void checkForInactivity() {
+		long now = System.currentTimeMillis();
+		Set<String> toAddback = new HashSet<String>();
+
+		while (!interestedInInactivity.isEmpty()) {
+			long k = interestedInInactivity.firstKey();
+			if (k > now) {
+				break;
+			}
+			Set<String> bindingStringSet = interestedInInactivity.remove(k);
+			Iterator<String> iterator = bindingStringSet.iterator();
+
+			while (iterator.hasNext()) {
+				String key = iterator.next();
+				EventableChannel t = Connections.get(key);
+				if (t != null) {
+					if (t.isInactive()){
+						System.out.println("Schedule a close on the connection");
+						t.scheduleClose(true);	
+					}
+					else
+						toAddback.add(t.getBinding());
+				}
+			}
+		}
+		if (!toAddback.isEmpty())
+			addToInactivityCheck(toAddback);
+	}
+
+	public void addToInactivityCheck(Set<String> sids) {
+		Iterator<String> iterator = sids.iterator();
+		while (iterator.hasNext()) {
+			String sid = iterator.next();
+			EventableChannel t = Connections.get(sid);
+			setCommInactivityTimeout(t);
+		}
+	}
+
 	
 	void close() throws IOException {
 		mySelector.close();
@@ -307,14 +331,48 @@ public class EmReactor {
 	}
 	
 	public void sendData (String sig, ByteBuffer bb) throws IOException {
-		(Connections.get(sig)).scheduleOutboundData( bb );
+		try {
+			EventableChannel ec = Connections.get(sig);
+			if(ec != null) ec.scheduleOutboundData(bb);
+		} catch(ClientDisconnectException ex){
+			System.out.println("Error while writing data to socket");
+			cleanupConnection(Connections.get(sig));
+		}
 	}
+	
 	public void sendData (String sig, byte[] data) throws IOException {
 		sendData (sig, ByteBuffer.wrap(data));
 		//(Connections.get(sig)).scheduleOutboundData( ByteBuffer.wrap(data.getBytes()));
 	}
-	public void setCommInactivityTimeout (String sig, long mills) {
-		(Connections.get(sig)).setCommInactivityTimeout (mills);
+	public void setCommInactivityTimeout(EventableChannel t) {
+		long timeout = t.getLastActivity() + t.getInActivityPeriod() * 1000;
+		Set<String> oldSet = interestedInInactivity.get(timeout);
+		String sig = t.getBinding();
+
+		if (oldSet == null) {
+			oldSet = new HashSet<String>();
+			oldSet.add(sig);
+		} else
+			oldSet.add(sig);
+
+		interestedInInactivity.put(timeout, oldSet);
+		t.setInactivityKey(timeout);
+	}
+
+	public void setCommInactivityTimeout(String sig, int seconds) {
+		long timeout = System.currentTimeMillis() + seconds * 1000;
+		Set<String> oldSet = interestedInInactivity.get(timeout);
+
+		if (oldSet == null) {
+			oldSet = new HashSet<String>();
+			oldSet.add(sig);
+		} else {
+			oldSet.add(sig);
+		}
+		interestedInInactivity.put(timeout, oldSet);
+		EventableChannel conn = Connections.get(sig);
+		conn.setCommInactivityTimeout(seconds);
+		conn.setInactivityKey(timeout);
 	}
 	
 	/**
@@ -369,7 +427,7 @@ public class EmReactor {
 			if (bindAddr != null)
 				sc.socket().bind(new InetSocketAddress (bindAddr, bindPort));
 
-			EventableSocketChannel ec = new EventableSocketChannel (sc, b, mySelector);
+			EventableSocketChannel ec = new EventableSocketChannel (sc, b, mySelector,0);
 
 			if (sc.connect (new InetSocketAddress (address, port))) {
 				// Connection returned immediately. Can happen with localhost connections.
