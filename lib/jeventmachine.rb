@@ -48,11 +48,11 @@ module EventMachine
       EventMachine::event_callback a1, a2, s
     end
   end
-  class Connection < com.rubyeventmachine.Connection
-    def associate_callback_target sig
-      # No-op for the time being.
-    end
-  end
+  # class Connection < com.rubyeventmachine.Connection
+  #   def associate_callback_target sig
+  #     # No-op for the time being.
+  #   end
+  # end
   def self.initialize_event_machine
     @em = JEM.new
   end
