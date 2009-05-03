@@ -165,7 +165,6 @@ public class EventableSocketChannel implements EventableChannel {
 				if (b.hasRemaining())
 					n = channel.write(b);
 			} catch (IOException e) {
-				System.out.println("Error while writing exception");
 				signalConnectionFail();
 				//return false;
 			}
@@ -180,7 +179,6 @@ public class EventableSocketChannel implements EventableChannel {
 			cancelWrite();	
 		}
 		else if (!outboundQ.isEmpty() && !writeScheduled) {
-			System.out.println("############ schedule write event ######## ");
 			writeScheduled = true;
 			channelKey.interestOps(SelectionKey.OP_WRITE);
 		}
